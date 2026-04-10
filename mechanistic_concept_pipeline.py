@@ -61,7 +61,7 @@ class PipelineConfig:
     sae_enabled: bool = False
     sae_path: Optional[str] = None
 
-    dtype: str = "bfloat16"
+    dtype: str = "float16"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
