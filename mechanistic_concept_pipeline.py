@@ -788,6 +788,7 @@ def main() -> None:
         config.model_name,
         device=config.device,
         dtype=get_torch_dtype(config.dtype),
+        center_unembed=False  
     )
     model.eval()
     ensure_tokenizer_padding(model)
