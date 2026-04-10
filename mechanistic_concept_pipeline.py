@@ -36,7 +36,7 @@ class PipelineConfig:
     seq_len: int = 32
     seq_pos: int = 15
 
-    bank_size: int = 1000
+    bank_size: int = 10000
     bank_batch_size: int = 16
     num_runs: int = 10
     langevin_steps: int = 100
@@ -633,10 +633,14 @@ def reveal_tokens_for_concept(
     with torch.no_grad():
         v_norm_concept = final_norm(x_concept)
         v_norm_base = final_norm(x_mean_device)
+        target_device = w_u.device
+        v_norm_concept = v_norm_concept.to(target_device)
+        v_norm_base = v_norm_base.to(target_device)
 
         logits_concept = v_norm_concept @ w_u
         logits_base = v_norm_base @ w_u
         if b_u is not None:
+            b_u = b_u.to(target_device)
             logits_concept = logits_concept + b_u
             logits_base = logits_base + b_u
 
