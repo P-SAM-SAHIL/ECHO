@@ -309,8 +309,9 @@ def langevin_optimize(
             target_neuron=config.target_neuron,
             injected_vector=x_t,
         )
-        activation.backward()
-        grad = x_t.grad.detach()
+        
+        # Calculate gradients ONLY for x_t instead of the entire model
+        grad = torch.autograd.grad(outputs=activation, inputs=x_t)[0].detach()
 
         with torch.no_grad():
             score, weights, sq_dists = compute_kde_terms(
@@ -670,11 +671,11 @@ def analyze_direct_pathway(
     target_block = model.blocks[config.target_layer]
     source_block = model.blocks[config.source_layer]
 
-    w_in = target_block.mlp.W_in
-    w_out = source_block.mlp.W_out
+    # FIX: Detach and move weights to the same device immediately
+    w_in = target_block.mlp.W_in.detach().to(config.device)
+    w_out = source_block.mlp.W_out.detach().to(config.device)
 
     # 1. Robust shape handling for Target Read Weights
-    # TLens standard is typically [d_model, d_mlp], but we dynamically align it.
     if w_in.shape[1] > w_in.shape[0] and config.target_neuron < w_in.shape[1]:
         read_weights = w_in[:, config.target_neuron]
         d_model = w_in.shape[0]
@@ -685,18 +686,17 @@ def analyze_direct_pathway(
         raise ValueError(f"Target neuron {config.target_neuron} out of bounds for W_in shape {w_in.shape}")
 
     # 2. Robust RMSNorm folding
-    # Default to 1.0 in case TransformerLens has already folded the norm
     ln_gain = 1.0  
     if hasattr(target_block, "ln2") and target_block.ln2 is not None:
         if hasattr(target_block.ln2, "w") and target_block.ln2.w is not None:
-            ln_gain = target_block.ln2.w
+            # FIX: Also ensure layer norm gain is on the same device
+            ln_gain = target_block.ln2.w.detach().to(config.device)
         elif hasattr(target_block.ln2, "weight") and target_block.ln2.weight is not None:
-            ln_gain = target_block.ln2.weight
+            ln_gain = target_block.ln2.weight.detach().to(config.device)
             
     read_weights_folded = read_weights * ln_gain # Shape: [d_model]
 
     # 3. Robust shape handling for Source Write Weights
-    # We need w_out_aligned to be [d_mlp, d_model] for the math to work safely.
     if w_out.shape[1] == d_model:
         w_out_aligned = w_out 
     elif w_out.shape[0] == d_model:
@@ -705,20 +705,16 @@ def analyze_direct_pathway(
         raise RuntimeError(f"W_out shape {w_out.shape} does not match extracted d_model={d_model}")
 
     # 4. Calculate Pathway Scores (Source Neuron Contributions)
-    # [d_mlp, d_model] @ [d_model] -> [d_mlp]
     pathway_scores = w_out_aligned @ read_weights_folded
 
     top_source_neuron = int(torch.argmax(torch.abs(pathway_scores)).item())
     top_source_score = float(pathway_scores[top_source_neuron].item())
 
     # 5. Construct the Residual Superhighway
-    # Push the scores back through the write weights to get the residual direction
-    # [1, d_mlp] @ [d_mlp, d_model] -> [1, d_model]
     residual_path_direction = pathway_scores.unsqueeze(0) @ w_out_aligned
     residual_path_direction = F.normalize(residual_path_direction, dim=1)
 
     # 6. Evaluate Alignment
-    # Ensure concept is properly shaped [1, d_model] before cosine similarity
     concept_norm = F.normalize(concept_vector.to(config.device), dim=1)
     if concept_norm.ndim == 1:
         concept_norm = concept_norm.unsqueeze(0)
