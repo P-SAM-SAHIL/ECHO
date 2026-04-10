@@ -36,7 +36,7 @@ class PipelineConfig:
     seq_len: int = 32
     seq_pos: int = 15
 
-    bank_size: int = 10000
+    bank_size: int = 1000
     bank_batch_size: int = 16
     num_runs: int = 10
     langevin_steps: int = 100
@@ -673,31 +673,58 @@ def analyze_direct_pathway(
     w_in = target_block.mlp.W_in
     w_out = source_block.mlp.W_out
 
-    if w_in.ndim != 2 or w_out.ndim != 2:
-        raise RuntimeError("Unexpected MLP weight ranks; expected 2D matrices.")
+    # 1. Robust shape handling for Target Read Weights
+    # TLens standard is typically [d_model, d_mlp], but we dynamically align it.
+    if w_in.shape[1] > w_in.shape[0] and config.target_neuron < w_in.shape[1]:
+        read_weights = w_in[:, config.target_neuron]
+        d_model = w_in.shape[0]
+    elif config.target_neuron < w_in.shape[0]:
+        read_weights = w_in[config.target_neuron, :]
+        d_model = w_in.shape[1]
+    else:
+        raise ValueError(f"Target neuron {config.target_neuron} out of bounds for W_in shape {w_in.shape}")
 
-    if config.target_neuron >= w_in.shape[1]:
-        raise ValueError(
-            f"Target neuron index {config.target_neuron} is out of range for target layer with {w_in.shape[1]} neurons."
-        )
+    # 2. Robust RMSNorm folding
+    # Default to 1.0 in case TransformerLens has already folded the norm
+    ln_gain = 1.0  
+    if hasattr(target_block, "ln2") and target_block.ln2 is not None:
+        if hasattr(target_block.ln2, "w") and target_block.ln2.w is not None:
+            ln_gain = target_block.ln2.w
+        elif hasattr(target_block.ln2, "weight") and target_block.ln2.weight is not None:
+            ln_gain = target_block.ln2.weight
+            
+    read_weights_folded = read_weights * ln_gain # Shape: [d_model]
 
-    read_weights = w_in[:, config.target_neuron]
+    # 3. Robust shape handling for Source Write Weights
+    # We need w_out_aligned to be [d_mlp, d_model] for the math to work safely.
+    if w_out.shape[1] == d_model:
+        w_out_aligned = w_out 
+    elif w_out.shape[0] == d_model:
+        w_out_aligned = w_out.T
+    else:
+        raise RuntimeError(f"W_out shape {w_out.shape} does not match extracted d_model={d_model}")
 
-    if not hasattr(target_block, "ln2") or target_block.ln2 is None or not hasattr(target_block.ln2, "w"):
-        raise AttributeError("Expected target block to expose ln2.w for RMSNorm folding.")
+    # 4. Calculate Pathway Scores (Source Neuron Contributions)
+    # [d_mlp, d_model] @ [d_model] -> [d_mlp]
+    pathway_scores = w_out_aligned @ read_weights_folded
 
-    ln_gain = target_block.ln2.w
-    read_weights_folded = read_weights * ln_gain
-
-    pathway_scores = w_out @ read_weights_folded
     top_source_neuron = int(torch.argmax(torch.abs(pathway_scores)).item())
     top_source_score = float(pathway_scores[top_source_neuron].item())
 
-    residual_path_direction = pathway_scores.unsqueeze(0) @ w_out
+    # 5. Construct the Residual Superhighway
+    # Push the scores back through the write weights to get the residual direction
+    # [1, d_mlp] @ [d_mlp, d_model] -> [1, d_model]
+    residual_path_direction = pathway_scores.unsqueeze(0) @ w_out_aligned
     residual_path_direction = F.normalize(residual_path_direction, dim=1)
 
+    # 6. Evaluate Alignment
+    # Ensure concept is properly shaped [1, d_model] before cosine similarity
+    concept_norm = F.normalize(concept_vector.to(config.device), dim=1)
+    if concept_norm.ndim == 1:
+        concept_norm = concept_norm.unsqueeze(0)
+
     alignment = F.cosine_similarity(
-        F.normalize(concept_vector.to(config.device), dim=1),
+        concept_norm,
         residual_path_direction,
         dim=1,
     ).item()
