@@ -715,8 +715,25 @@ def analyze_direct_pathway(
     top_source_score = float(pathway_scores[top_source_neuron].item())
 
     # 5. Construct the Residual Superhighway
-    residual_path_direction = pathway_scores.unsqueeze(0) @ w_out_aligned
-    residual_path_direction = F.normalize(residual_path_direction, dim=1)
+    # 5. Construct the Operator Matrix and run explicit SVD
+    # We construct the 2D matrix by scaling the source Write Weights (W_out) 
+    # by how much the target neuron listens to them (pathway_scores).
+    # operator_matrix Shape: [d_mlp, d_model]
+    operator_matrix = pathway_scores.unsqueeze(1) * w_out_aligned
+
+    # Run PyTorch's explicit SVD
+    # U  shape: [d_mlp, min(d_mlp, d_model)]
+    # S  shape: [min(d_mlp, d_model)] (Singular values)
+    # Vh shape: [min(d_mlp, d_model), d_model] (Right singular vectors transposed)
+    U, S, Vh = torch.linalg.svd(operator_matrix, full_matrices=False)
+
+    # Extract v_1: The Top Right Singular Vector (first row of Vh)
+    residual_path_direction = Vh[0, :].unsqueeze(0) 
+
+    # SVD can sometimes flip the sign arbitrarily. We ensure the direction 
+    # points positively toward the target neuron's read weights.
+    if torch.sum(residual_path_direction @ w_out_aligned.T @ pathway_scores) < 0:
+        residual_path_direction = -residual_path_direction
 
     # 6. Evaluate Alignment
     concept_norm = F.normalize(concept_vector.to(config.device), dim=1)
@@ -735,6 +752,10 @@ def analyze_direct_pathway(
         "pathway_alignment_cosine": alignment,
         "pathway_scores_norm": float(pathway_scores.norm().item()),
         "residual_path_direction": residual_path_direction.detach().cpu(),
+        
+        # --- NEW SVD OUTPUTS ---
+        "top_singular_value": float(S[0].item()),
+        "all_singular_values": S.detach().cpu(), # Add this if you want to inspect the drop-off
     }
 
 
