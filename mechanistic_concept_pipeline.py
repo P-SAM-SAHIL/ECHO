@@ -61,7 +61,7 @@ class PipelineConfig:
     sae_enabled: bool = False
     sae_path: Optional[str] = None
 
-    dtype: str = "float32"
+    dtype: str = "bfloat16"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -243,7 +243,7 @@ def run_activation_with_injection(
 
     def inject_hook(resid: torch.Tensor, hook) -> torch.Tensor:
         resid = resid.clone()
-        resid[:, seq_pos, :] = injected_vector
+        resid[:, seq_pos, :] = injected_vector.to(resid.device)
         return resid
 
     def measure_hook(act_tensor: torch.Tensor, hook) -> torch.Tensor:
@@ -786,8 +786,8 @@ def main() -> None:
 
     model = HookedTransformer.from_pretrained(
         config.model_name,
-        device=config.device,
-        dtype=get_torch_dtype(config.dtype),
+        n_devices=2,                           # <-- Tells TransformerLens to use both GPUs
+        dtype=get_torch_dtype(config.dtype),   # Now bfloat16
         center_unembed=False  
     )
     model.eval()
