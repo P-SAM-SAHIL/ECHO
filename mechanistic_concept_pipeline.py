@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
 
 @dataclass
 class PipelineConfig:
-    model_name: str = "google/gemma-2-2b-it"
+    model_name: str = "google/gemma-2-2b"
     dataset_name: str = "NeelNanda/pile-10k"
     dataset_split: str = "train"
     output_dir: str = "results/concept_extraction_logs"
