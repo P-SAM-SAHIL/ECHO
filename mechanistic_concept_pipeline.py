@@ -511,8 +511,10 @@ def evaluate_concepts(
     source_hook_name: str,
     target_hook_name: str,
 ) -> List[Dict[str, object]]:
-    concepts = torch.tensor(decomp_result["concepts"], dtype=torch.float32, device=config.device)
-    loadings = torch.tensor(decomp_result["loadings"], dtype=torch.float32, device=config.device)
+    target_dtype = successful_vectors.dtype
+    concepts = torch.tensor(decomp_result["concepts"], dtype=target_dtype, device=config.device)
+    loadings = torch.tensor(decomp_result["loadings"], dtype=target_dtype, device=config.device)
+    
     successful_vectors_device = successful_vectors.to(config.device)
     x_mean_device = x_mean.to(config.device)
     x_bank_device = x_bank.to(config.device)
