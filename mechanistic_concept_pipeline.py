@@ -13,6 +13,8 @@ from datasets import load_dataset
 from sklearn.decomposition import FastICA, PCA
 from transformer_lens import HookedTransformer
 
+from sae_lens import SAE
+
 try:
     import matplotlib.pyplot as plt
 except ImportError:  # pragma: no cover
@@ -58,8 +60,10 @@ class PipelineConfig:
     top_k_tokens: int = 15
     plot_outputs: bool = True
 
-    sae_enabled: bool = False
-    sae_path: Optional[str] = None
+    sae_enabled: bool = True
+    sae_path: str = "layer_11/width_16k/average_l0_71"
+    sae_neuropedia_model: str = "gemma-2-2b"
+    sae_neuropedia_id: str = "11-gemmascope-res-16k"
 
     dtype: str = "float16"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -784,21 +788,56 @@ def serialize_report(report: Dict[str, object]) -> Dict[str, object]:
     return serializable
 
 
-def run_sae_corroboration_placeholder(
+def run_sae_corroboration(
     concept_vector: torch.Tensor,
     optimized_vector: torch.Tensor,
+    sae_weights: Optional[Dict[str, torch.Tensor]],
     config: PipelineConfig,
 ) -> Dict[str, object]:
-    if not config.sae_enabled or not config.sae_path:
-        return {
-            "status": "skipped",
-            "reason": "No exact SAE dictionary path provided for the same Gemma layer/site.",
-        }
+    if not config.sae_enabled or sae_weights is None:
+        return {"status": "skipped"}
 
-    _ = concept_vector, optimized_vector
+    device = config.device
+    x_opt = optimized_vector.detach().to(device)
+    c_k = concept_vector.detach().to(device)
+    
+    if x_opt.dim() == 1:
+        x_opt = x_opt.unsqueeze(0)
+
+    W_enc = sae_weights["W_enc"].to(device)
+    W_dec = sae_weights["W_dec"].to(device)
+    b_enc = sae_weights["b_enc"].to(device)
+    b_dec = sae_weights["b_dec"].to(device)
+
+    x_centered = x_opt - b_dec
+    f_x = F.relu(x_centered @ W_enc + b_enc)
+
+    top_activation, top_feature_idx = torch.max(f_x, dim=1)
+    top_idx = int(top_feature_idx.item())
+    activation_val = float(top_activation.item())
+
+    d_sae = W_dec[top_idx, :]
+    c_k_norm = F.normalize(c_k.squeeze(), dim=0)
+    d_sae_norm = F.normalize(d_sae.squeeze(), dim=0)
+
+    alignment = F.cosine_similarity(c_k_norm, d_sae_norm, dim=0).item()
+
+    if alignment >= 0.7:
+        verdict = "perfect_corroboration"
+    elif alignment <= 0.3:
+        verdict = "dark_feature_or_split"
+    else:
+        verdict = "partial_alignment"
+
+    neuropedia_url = f"https://www.neuropedia.ai/{config.sae_neuropedia_model}/{config.sae_neuropedia_id}/{top_idx}"
+
     return {
-        "status": "not_implemented",
-        "reason": "Provide a layer/site-matched SAE loader for Gemma-2-2B and plug it into this function.",
+        "status": "success",
+        "top_sae_feature_index": top_idx,
+        "top_sae_feature_activation": activation_val,
+        "decoder_alignment_cosine": alignment,
+        "verdict": verdict,
+        "neuropedia_link": neuropedia_url,
     }
 
 
@@ -918,6 +957,22 @@ def main() -> None:
     logging.info("Phase 4: decomposition with FastICA and Semi-NMF")
     decomposition_results = run_decomposition(successful_vectors=successful_vectors, config=config)
 
+    # 1. ADD SAE LOADING LOGIC HERE (Right after decomposition_results)
+    sae_weights = None
+    if config.sae_enabled:
+        logging.info("Downloading/Loading GemmaScope SAE via SAELens...")
+        sae, _, _ = SAE.from_pretrained(
+            release="gemma-scope-2b-pt-res", 
+            sae_id=config.sae_path,
+            device=config.device
+        )
+        sae_weights = {
+            "W_enc": sae.W_enc.detach(), 
+            "W_dec": sae.W_dec.detach(),
+            "b_enc": sae.b_enc.detach(),
+            "b_dec": sae.b_dec.detach(),
+        }
+
     concept_reports: Dict[str, List[Dict[str, object]]] = {}
     token_reports: Dict[str, List[Dict[str, object]]] = {}
     pathway_reports: Dict[str, List[Dict[str, object]]] = {}
@@ -960,9 +1015,11 @@ def main() -> None:
             )
             pathway_reports[method_name].append(pathway_report)
 
-            sae_report = run_sae_corroboration_placeholder(
+            # 2. REPLACE PLACEHOLDER WITH REAL SAE FUNCTION AND PASS WEIGHTS
+            sae_report = run_sae_corroboration(
                 concept_vector=report["concept_vector"],
                 optimized_vector=report["x_opt"],
+                sae_weights=sae_weights,
                 config=config,
             )
             sae_reports[method_name].append(sae_report)
@@ -975,6 +1032,22 @@ def main() -> None:
                 report["cosine_precheck"],
                 pathway_report["pathway_alignment_cosine"],
             )
+            
+            # 3. ADD SAE LOGGING VERDICTS HERE
+            if sae_report["status"] == "success":
+                logging.info(
+                    "%s Concept %d | SAE Feature %d | Cosine=%.4f | Verdict: %s",
+                    method_name,
+                    report["concept_index"],
+                    sae_report["top_sae_feature_index"],
+                    sae_report["decoder_alignment_cosine"],
+                    sae_report["verdict"]
+                )
+                logging.info(
+                    "--> Verify on Neuropedia: %s", 
+                    sae_report["neuropedia_link"]
+                )
+
             logging.info(
                 "%s concept %d top tokens: %s",
                 method_name,
@@ -1007,7 +1080,6 @@ def main() -> None:
         json.dump(serialized, f, indent=2)
 
     logging.info("Pipeline complete. Outputs saved to %s", config.output_dir)
-
 
 if __name__ == "__main__":
     main()
