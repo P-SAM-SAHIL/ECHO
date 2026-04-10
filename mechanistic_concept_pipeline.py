@@ -61,7 +61,7 @@ class PipelineConfig:
     plot_outputs: bool = True
 
     sae_enabled: bool = True
-    sae_path: str = "layer_11/width_16k/average_l0_71"
+    sae_path: str = "layer_11/width_16k/average_l0_79"
     sae_neuropedia_model: str = "gemma-2-2b"
     sae_neuropedia_id: str = "11-gemmascope-res-16k"
 
