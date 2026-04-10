@@ -829,7 +829,7 @@ def run_sae_corroboration(
     else:
         verdict = "partial_alignment"
 
-    neuropedia_url = f"https://www.neuropedia.ai/{config.sae_neuropedia_model}/{config.sae_neuropedia_id}/{top_idx}"
+    neuropedia_url = f"https://www.neuronpedia.org/{config.sae_neuropedia_model}/{config.sae_neuropedia_id}/{top_idx}"
 
     return {
         "status": "success",
