@@ -65,7 +65,7 @@ class PipelineConfig:
     sae_neuropedia_model: str = "gemma-2-2b"
     sae_neuropedia_id: str = "11-gemmascope-res-16k"
 
-    dtype: str = "float16"
+    dtype: str = "float32"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
