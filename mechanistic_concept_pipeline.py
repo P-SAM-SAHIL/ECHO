@@ -61,7 +61,7 @@ class PipelineConfig:
     plot_outputs: bool = True
 
     sae_enabled: bool = True
-    sae_path: str = "layer_11/width_16k/average_l0_79"
+    sae_path: str = "layer_11/width_16k/canonical" 
     sae_neuropedia_model: str = "gemma-2-2b"
     sae_neuropedia_id: str = "11-gemmascope-res-16k"
 
@@ -962,7 +962,7 @@ def main() -> None:
     if config.sae_enabled:
         logging.info("Downloading/Loading GemmaScope SAE via SAELens...")
         sae, _, _ = SAE.from_pretrained(
-            release="gemma-scope-2b-pt-res", 
+            release="gemma-scope-2b-pt-res-canonical",  # <-- CHANGE THIS LINE
             sae_id=config.sae_path,
             device=config.device
         )
