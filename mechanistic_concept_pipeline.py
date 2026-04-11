@@ -33,12 +33,12 @@ class PipelineConfig:
     target_layer: int = 12
     source_site: str = "resid_mid"
     target_site: str = "mlp_post"
-    target_neuron: int = 42
+    target_neuron: int = 500
 
     seq_len: int = 32
     seq_pos: int = 15
 
-    bank_size: int = 10000
+    bank_size: int = 1000
     bank_batch_size: int = 16
     num_runs: int = 10
     langevin_steps: int = 100
@@ -709,7 +709,6 @@ def analyze_direct_pathway(
     top_source_score = float(pathway_scores[top_source_neuron].item())
 
     # 5. Construct the Residual Superhighway
-    # 5. Construct the Operator Matrix and run explicit SVD
     # We construct the 2D matrix by scaling the source Write Weights (W_out) 
     # by how much the target neuron listens to them (pathway_scores).
     # operator_matrix Shape: [d_mlp, d_model]
@@ -740,6 +739,25 @@ def analyze_direct_pathway(
         dim=1,
     ).item()
 
+    # 7. Project the SVD direction to the Unembeddings
+    w_u, b_u = get_unembedding_weights(model)
+    target_device = w_u.device
+    
+    # Move the SVD direction to the correct device
+    v_dir = residual_path_direction.to(target_device)
+    
+    # Project the pure direction directly onto the unembedding matrix
+    # This acts as a dot product between the path direction and token embeddings
+    pathway_logits = v_dir @ w_u
+    
+    # Get the top 10 and bottom 10 tokens for this communication pathway
+    k_tokens = 10
+    top_path_k = torch.topk(pathway_logits[0], k=k_tokens)
+    bottom_path_k = torch.topk(pathway_logits[0], k=k_tokens, largest=False)
+    
+    pathway_top_tokens = model.tokenizer.convert_ids_to_tokens(top_path_k.indices.tolist())
+    pathway_bottom_tokens = model.tokenizer.convert_ids_to_tokens(bottom_path_k.indices.tolist())
+
     return {
         "top_source_neuron": top_source_neuron,
         "top_source_score": top_source_score,
@@ -749,9 +767,12 @@ def analyze_direct_pathway(
         
         # --- NEW SVD OUTPUTS ---
         "top_singular_value": float(S[0].item()),
-        "all_singular_values": S.detach().cpu(), # Add this if you want to inspect the drop-off
+        "all_singular_values": S.detach().cpu(), 
+        
+        # --- NEW TOKEN OUTPUTS ---
+        "pathway_top_tokens": pathway_top_tokens,
+        "pathway_bottom_tokens": pathway_bottom_tokens,
     }
-
 
 def maybe_plot_results(
     config: PipelineConfig,
@@ -1080,6 +1101,13 @@ def main() -> None:
                     sae_report["neuropedia_link"]
                 )
 
+            # ---> ADDED THIS NEW PRINT STATEMENT HERE <---
+            logging.info(
+                "%s pathway SVD top tokens: %s",
+                method_name,
+                pathway_report["pathway_top_tokens"],
+            )
+
             logging.info(
                 "%s concept %d top tokens: %s",
                 method_name,
@@ -1112,5 +1140,7 @@ def main() -> None:
         json.dump(serialized, f, indent=2)
 
     logging.info("Pipeline complete. Outputs saved to %s", config.output_dir)
+
+    
 if __name__ == "__main__":
     main()
