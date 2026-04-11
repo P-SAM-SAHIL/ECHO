@@ -43,9 +43,9 @@ class PipelineConfig:
     num_runs: int = 10
     langevin_steps: int = 100
     
-    eta_act: float = 0.01    # The Target Push learning rate
-    eta_sem: float = 0.001    # The Semantic Pull learning rate
-    noise_sigma: float = 0.015 # Langevin exploration noise
+    eta_act: float = 0.5    # The Target Push learning rate
+    eta_sem: float = 0.00    # The Semantic Pull learning rate
+    noise_sigma: float = 0.0 # Langevin exploration noise
     pca_k_components: int = 128
 
     convergence_fraction_of_best: float = 0.8
