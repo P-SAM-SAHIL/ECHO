@@ -38,7 +38,7 @@ class PipelineConfig:
     seq_len: int = 32
     seq_pos: int = 15
 
-    bank_size: int = 1000
+    bank_size: int = 10000
     bank_batch_size: int = 16
     num_runs: int = 10
     langevin_steps: int = 100
