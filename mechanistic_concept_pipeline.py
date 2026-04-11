@@ -29,8 +29,8 @@ class PipelineConfig:
     output_dir: str = "results/concept_extraction_logs"
     seed: int = 42
 
-    source_layer: int = 11
-    target_layer: int = 12
+    source_layer: int = 12
+    target_layer: int = 13
     source_site: str = "resid_mid"
     target_site: str = "mlp_post"
     target_neuron: int = 500
