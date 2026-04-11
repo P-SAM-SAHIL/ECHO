@@ -42,10 +42,11 @@ class PipelineConfig:
     bank_batch_size: int = 16
     num_runs: int = 10
     langevin_steps: int = 100
-    learning_rate: float = 0.05
-    prior_strength: float = 0.1
-    kde_bandwidth_sigma2: float = 10.0
-    noise_scale: float = 1.0
+    
+    eta_act: float = 0.05    # The Target Push learning rate
+    eta_sem: float = 0.01    # The Semantic Pull learning rate
+    noise_sigma: float = 0.005 # Langevin exploration noise
+    pca_k_components: int = 128
 
     convergence_fraction_of_best: float = 0.8
     minimum_success_count: int = 3
@@ -267,43 +268,44 @@ def run_activation_with_injection(
     return activation_box["activation"]
 
 
-def compute_kde_terms(
-    x_t: torch.Tensor,
-    x_bank: torch.Tensor,
-    sigma2: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    diffs = x_bank - x_t
-    sq_dists = torch.sum(diffs * diffs, dim=1)
-    logits = -sq_dists / (2.0 * sigma2)
-    weights = torch.softmax(logits, dim=0)
-    center_of_mass = torch.sum(weights.unsqueeze(1) * x_bank, dim=0, keepdim=True)
-    score = center_of_mass - x_t
-    return score, weights, sq_dists
 
 
-def kde_log_density(x_t: torch.Tensor, x_bank: torch.Tensor, sigma2: float) -> float:
-    sq_dists = torch.sum((x_bank - x_t) ** 2, dim=1)
-    d_model = x_bank.shape[1]
-    logits = -sq_dists / (2.0 * sigma2)
-    log_norm = 0.5 * d_model * math.log(2.0 * math.pi * sigma2)
-    log_prob = torch.logsumexp(logits, dim=0) - math.log(x_bank.shape[0]) - log_norm
-    return float(log_prob.item())
+
+
 
 
 def langevin_optimize(
     model: HookedTransformer,
     dummy_tokens: torch.Tensor,
-    x_bank: torch.Tensor,
-    initial_vector: torch.Tensor,
+    x_mean: torch.Tensor,
+    projection_matrix: torch.Tensor,
     config: PipelineConfig,
     source_hook_name: str,
     target_hook_name: str,
 ) -> Dict[str, object]:
-    x_t = initial_vector.clone().to(config.device)
+    
+    # Phase 3 Initialization
+    x_t = x_mean.clone().to(config.device)
     trace: List[float] = []
+    
+    # Fetch weights for the Semantic Pull (EBM)
+    final_norm = get_final_norm_module(model)
+    w_u, b_u = get_unembedding_weights(model)
+    w_u = w_u.to(config.device)
+    if b_u is not None:
+        b_u = b_u.to(config.device)
+
+    # Precompute baseline logits for Contrastive EBM
+    with torch.no_grad():
+        v_norm_mu = final_norm(x_mean)
+        logits_mu = v_norm_mu @ w_u
+        if b_u is not None:
+            logits_mu += b_u
 
     for step in range(config.langevin_steps):
         x_t = x_t.detach().requires_grad_(True)
+        
+        # --- STEP 1: The Target Push (Activation Ascent) ---
         activation = run_activation_with_injection(
             model=model,
             dummy_tokens=dummy_tokens,
@@ -313,61 +315,58 @@ def langevin_optimize(
             target_neuron=config.target_neuron,
             injected_vector=x_t,
         )
+        g_act = torch.autograd.grad(outputs=activation, inputs=x_t, retain_graph=True)[0]
         
-        # Calculate gradients ONLY for x_t instead of the entire model
-        grad = torch.autograd.grad(outputs=activation, inputs=x_t)[0].detach()
+        # --- STEP 2: The Semantic Pull (Contrastive EBM) ---
+        v_norm_t = final_norm(x_t)
+        logits_t = v_norm_t @ w_u
+        if b_u is not None:
+            logits_t += b_u
+            
+        # E(x_t) = -log sum exp(logits_t - logits_mu)
+        diff = logits_t - logits_mu
+        energy = -torch.logsumexp(diff, dim=-1)
+        g_sem = torch.autograd.grad(outputs=energy, inputs=x_t)[0]
 
         with torch.no_grad():
-            score, weights, sq_dists = compute_kde_terms(
-                x_t=x_t.detach(),
-                x_bank=x_bank,
-                sigma2=config.kde_bandwidth_sigma2,
-            )
-            noise = (
-                math.sqrt(2.0 * config.learning_rate)
-                * config.noise_scale
-                * torch.randn_like(x_t)
-            )
-            x_t = (
-                x_t.detach()
-                + config.learning_rate * grad
-                + (config.prior_strength * config.learning_rate / config.kde_bandwidth_sigma2) * score
-                + noise
-            )
+            # --- STEP 3: The Gradient Update ---
+            x_prime = x_t + (config.eta_act * g_act) - (config.eta_sem * g_sem)
+            
+            # --- STEP 4: The Langevin Exploration ---
+            noise = config.noise_sigma * torch.randn_like(x_prime)
+            x_double_prime = x_prime + noise
+            
+            # --- STEP 5: The Subspace Projection ---
+            # x'''_t = P_k(x''_t - mu) + mu
+            x_triple_prime = (x_double_prime - x_mean) @ projection_matrix.T + x_mean
+            
+            # --- STEP 6: The Norm Restoration ---
+            mu_norm = torch.norm(x_mean, p=2)
+            current_norm = torch.norm(x_triple_prime, p=2).clamp_min(1e-12)
+            x_t = x_triple_prime * (mu_norm / current_norm)
 
         trace.append(float(activation.item()))
 
         if step % 10 == 0 or step == config.langevin_steps - 1:
             logging.info(
-                "Run step %d/%d | activation=%.4f | grad_norm=%.4f | mean_dist=%.4f",
-                step + 1,
-                config.langevin_steps,
-                activation.item(),
-                grad.norm().item(),
-                sq_dists.mean().item(),
+                "Step %d/%d | act=%.4f | g_act_norm=%.4f | g_sem_norm=%.4f",
+                step + 1, config.langevin_steps, activation.item(), 
+                g_act.norm().item(), g_sem.norm().item()
             )
 
+    # Final measurement
     final_activation = run_activation_with_injection(
-        model=model,
-        dummy_tokens=dummy_tokens,
-        source_hook_name=source_hook_name,
-        target_hook_name=target_hook_name,
-        seq_pos=config.seq_pos,
-        target_neuron=config.target_neuron,
-        injected_vector=x_t.detach(),
+        model=model, dummy_tokens=dummy_tokens, source_hook_name=source_hook_name,
+        target_hook_name=target_hook_name, seq_pos=config.seq_pos,
+        target_neuron=config.target_neuron, injected_vector=x_t.detach()
     )
 
     return {
         "vector": x_t.detach().cpu(),
         "final_activation": float(final_activation.item()),
         "trace": trace,
-        "kde_log_density": kde_log_density(
-            x_t.detach(),
-            x_bank=x_bank,
-            sigma2=config.kde_bandwidth_sigma2,
-        ),
+        "kde_log_density": 0.0, # Deprecated, kept for schema compatibility
     }
-
 
 def compute_pairwise_cosine_stats(vectors: torch.Tensor) -> Dict[str, float]:
     if vectors.shape[0] < 2:
@@ -570,12 +569,9 @@ def evaluate_concepts(
         denom = (a_opt - baseline_activation).item()
         drop_ratio = 0.0 if abs(denom) < 1e-9 else (a_opt.item() - a_ablated.item()) / denom
 
-        kde_opt = kde_log_density(x_opt, x_bank_device, config.kde_bandwidth_sigma2)
-        kde_ablated = kde_log_density(x_final_ablated, x_bank_device, config.kde_bandwidth_sigma2)
-
+       
         alpha = float(projected_activations.mean().item())
         x_concept = x_mean_device + alpha * c_k
-        off_manifold_warning = bool(kde_ablated < kde_opt - 5.0)
 
         results.append(
             {
@@ -591,9 +587,7 @@ def evaluate_concepts(
                 "activation_ablated": float(a_ablated.item()),
                 "activation_baseline": float(baseline_activation.item()),
                 "drop_ratio": float(drop_ratio),
-                "kde_log_density_opt": kde_opt,
-                "kde_log_density_ablated": kde_ablated,
-                "off_manifold_warning": off_manifold_warning,
+                
                 "alpha": alpha,
                 "x_opt": x_opt.detach().cpu(),
                 "x_ablated": x_final_ablated.detach().cpu(),
@@ -861,6 +855,23 @@ def run_sae_corroboration(
         "neuropedia_link": neuropedia_url,
     }
 
+def compute_projection_matrix(x_bank: torch.Tensor, k: int) -> torch.Tensor:
+    """Computes the orthogonal projection matrix P_k for the top-k PCA subspace."""
+    mu = x_bank.mean(dim=0, keepdim=True)
+    centered = x_bank - mu
+    
+    # Covariance matrix (Sigma)
+    cov = (centered.T @ centered) / (x_bank.shape[0] - 1)
+    
+    # Eigendecomposition (eigh returns ascending order)
+    eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+    
+    # Isolate U_k (top k eigenvectors)
+    U_k = eigenvectors[:, -k:]
+    
+    # Calculate P_k = U_k @ U_k^T
+    P_k = U_k @ U_k.T
+    return P_k
 
 def main() -> None:
     config = PipelineConfig()
@@ -875,9 +886,9 @@ def main() -> None:
 
     model = HookedTransformer.from_pretrained(
         config.model_name,
-        n_devices=2,                           # <-- Tells TransformerLens to use both GPUs
-        dtype=get_torch_dtype(config.dtype),   # Now bfloat16
-        center_unembed=False  
+        n_devices=2,
+        dtype=get_torch_dtype(config.dtype),
+        center_unembed=False 
     )
     model.eval()
     ensure_tokenizer_padding(model)
@@ -911,29 +922,32 @@ def main() -> None:
     )
     logging.info("Baseline activation at x_mean: %.4f", baseline_activation.item())
 
+    # --- NEW: Compute the Geometric Boundary ---
+    logging.info("Computing PCA Subspace Projection Matrix (k=%d)", config.pca_k_components)
+    P_k = compute_projection_matrix(x_bank, k=config.pca_k_components).to(config.device)
+
     logging.info("Phase 2/3: multi-seed Langevin optimization")
     run_records: List[Dict[str, object]] = []
+    
     for run_idx in range(config.num_runs):
-        init_idx = torch.randint(0, x_bank.shape[0], (1,), device=x_bank.device).item()
-        init_vector = x_bank[init_idx : init_idx + 1]
         record = langevin_optimize(
             model=model,
             dummy_tokens=dummy_tokens,
-            x_bank=x_bank,
-            initial_vector=init_vector,
+            x_mean=x_mean,               # Replaced x_bank with x_mean
+            projection_matrix=P_k,       # Passed the new boundary matrix
             config=config,
             source_hook_name=source_hook_name,
             target_hook_name=target_hook_name,
         )
-        record["init_bank_index"] = int(init_idx)
+        record["init_bank_index"] = 0    # Since we always init from mu now
         run_records.append(record)
+        
+        # --- NEW: Cleaned up logging (No KDE) ---
         logging.info(
-            "Run %d/%d complete | init_idx=%d | final_activation=%.4f | kde_log_density=%.4f",
+            "Run %d/%d complete | final_activation=%.4f",
             run_idx + 1,
             config.num_runs,
-            init_idx,
             record["final_activation"],
-            record["kde_log_density"],
         )
 
     final_activations = torch.tensor([r["final_activation"] for r in run_records], dtype=torch.float32)
@@ -978,12 +992,11 @@ def main() -> None:
     logging.info("Phase 4: decomposition with FastICA and Semi-NMF")
     decomposition_results = run_decomposition(successful_vectors=successful_vectors, config=config)
 
-    # 1. ADD SAE LOADING LOGIC HERE (Right after decomposition_results)
     sae_weights = None
     if config.sae_enabled:
         logging.info("Downloading/Loading GemmaScope SAE via SAELens...")
         sae, _, _ = SAE.from_pretrained(
-            release="gemma-scope-2b-pt-res-canonical",  # <-- CHANGE THIS LINE
+            release="gemma-scope-2b-pt-res-canonical",  
             sae_id=config.sae_path,
             device=config.device
         )
@@ -1036,7 +1049,6 @@ def main() -> None:
             )
             pathway_reports[method_name].append(pathway_report)
 
-            # 2. REPLACE PLACEHOLDER WITH REAL SAE FUNCTION AND PASS WEIGHTS
             sae_report = run_sae_corroboration(
                 concept_vector=report["concept_vector"],
                 optimized_vector=report["x_opt"],
@@ -1054,7 +1066,6 @@ def main() -> None:
                 pathway_report["pathway_alignment_cosine"],
             )
             
-            # 3. ADD SAE LOGGING VERDICTS HERE
             if sae_report["status"] == "success":
                 logging.info(
                     "%s Concept %d | SAE Feature %d | Cosine=%.4f | Verdict: %s",
@@ -1101,6 +1112,5 @@ def main() -> None:
         json.dump(serialized, f, indent=2)
 
     logging.info("Pipeline complete. Outputs saved to %s", config.output_dir)
-
 if __name__ == "__main__":
     main()
